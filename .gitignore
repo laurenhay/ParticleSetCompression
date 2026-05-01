@@ -1,0 +1,4 @@
+# ignore all files in any directory named plots or work
+plots/
+work/
+wandb/
