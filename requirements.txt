@@ -1,5 +1,7 @@
 torch
 numpy
+awkward
+vector
 matplotlib
 pandas
 tqdm

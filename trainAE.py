@@ -2,18 +2,25 @@ import os
 import torch
 from torch.utils.data import Dataset, DataLoader
 from model_VAE import JetDeepSetVAE
+from particleSetAE import ParticleSetAE
 from particleloader import load
 import numpy as np
+import awkward as ak
+import vector
 import wandb
 import argparse
+
+vector.register_awkward()
 
 #### start interactive session in terminal before any heavy lifting
 ## interact -n 12 -t 08:00:00 -m 64g
 parser = argparse.ArgumentParser()
 parser.add_argument("--generator", "-g", type = str, default = "pythia", required = False, help = "Which generator to use: options are herwig and pythia")
+parser.add_argument("--model", "-m", type = str, default = "VAE", choices = ["VAE", "PSAE"], help = "Which model to use: VAE or Particle Set AE")
 args = parser.parse_args()
 
 generator = args.generator
+model_type = args.model
 
 #### Check whether we've initiated any GPUs
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -84,11 +91,18 @@ print("Nparticles ", len(mask[0]))
 
 nconst = len(mask[0])
 zdim = nconst*feature_dim
-model = JetDeepSetVAE(
-    din=feature_dim,
-    nmax=nconst,
-    zdim=zdim
-).to(device)
+if model_type == "VAE":
+    model = JetDeepSetVAE(
+        din=feature_dim,
+        nmax=nconst,
+        zdim=zdim
+    ).to(device)
+else:
+    model = ParticleSetAE(
+        particle_dim=feature_dim,
+        max_particles=nconst,
+        z_dim=zdim
+    ).to(device)
 
 learning_rate = 1e-3
 beta = 1e-3
@@ -100,11 +114,11 @@ run = wandb.init(
     # Set the wandb entity where your project will be logged (generally your team name).
     entity="laurenhay-brown-university",
     # Set the wandb project where this run will be logged.
-    project="compression_VAE",
+    project="compression_AE",
     # Track hyperparameters and run metadata.
     config={
         "learning_rate": learning_rate,
-        "architecture": "VAE",
+        "architecture": model_type,
         "dataset": generator,
         "epochs": epochs,
         "batch_size": batch_size,
@@ -128,13 +142,13 @@ for epoch in range(epochs):
         mask_batch = mask_batch.to(device)
 
         optimizer.zero_grad()
-        if model=VAE:
+        if model_type == "VAE": 
             xhat, mu, logv, z = model(x, mask_batch)
             loss, recon, kl = vae_loss(x, mask_batch, xhat, mu, logv, beta=beta)
             running_recon += recon.item()
             running_kl += kl.item()
-        elif model=PSAE:
-            xhat, mask_logits, z = model(x, mask_batch)
+        else: 
+            xhat, z = model(x, mask_batch)
             loss = masked_mse_loss(xhat, x, mask_batch)
         loss.backward()
         optimizer.step()
@@ -143,17 +157,22 @@ for epoch in range(epochs):
 
 
     epoch_loss = running_loss / len(loader)
-    if model=VAE:
+    if model_type == "VAE":
         epoch_recon = running_recon / len(loader)
         epoch_kl = running_kl / len(loader)
         print(f"epoch {epoch:02d}  loss={epoch_loss:.6f}  recon={epoch_recon:.6f}  kl={epoch_kl:.6f}")
-    print(f"epoch {epoch:02d}  loss={epoch_loss:.6f}")
-    run.log({
-        "epoch": epoch,
-        "train/loss": epoch_loss,
-        "train/recon": epoch_recon,
-        "train/kl": epoch_kl,
-    })
+        run.log({
+            "epoch": epoch,
+            "train/loss": epoch_loss,
+            "train/recon": epoch_recon,
+            "train/kl": epoch_kl,
+        })
+    else:
+        print(f"epoch {epoch:02d}  loss={epoch_loss:.6f}")
+        run.log({
+            "epoch": epoch,
+            "train/loss": epoch_loss,
+        })
 
 
 eval_loader = DataLoader(
@@ -169,34 +188,38 @@ model.eval()
 all_x = []
 all_xhat = []
 all_mask = []
-all_mu = []
+all_mu = [] if model_type == "VAE" else None
 
 with torch.no_grad():
     for x, mask_batch in eval_loader:
         x = x.to(device)
         mask_batch = mask_batch.to(device)
 
-        xhat, mu, logv, z = model(x, mask_batch)
+        if model_type == "VAE":
+            xhat, mu, logv, z = model(x, mask_batch)
+            all_mu.append(mu.cpu())
+        else:
+            xhat, z = model(x, mask_batch)
 
         all_x.append(x.cpu())
         all_xhat.append(xhat.cpu())
         all_mask.append(mask_batch.cpu())
-        all_mu.append(mu.cpu())
 
 all_x = torch.cat(all_x, dim=0).numpy()
 all_xhat = torch.cat(all_xhat, dim=0).numpy()
 all_mask = torch.cat(all_mask, dim=0).numpy()
-all_mu = torch.cat(all_mu, dim=0).numpy()
+if model_type == "VAE":
+    all_mu = torch.cat(all_mu, dim=0).numpy()
 
 def jets_from_constituents(p, mask):
     pt  = p[:, :, 0] * mask
-    eta = p[:, :, 1]
-    phi = p[:, :, 2]
+    eta = p[:, :, 1] * mask
+    phi = p[:, :, 2] * mask
 
-    E  = np.sum(pt * np.cosh(eta) * mask, axis=1)
-    px = np.sum(pt * np.cos(phi) * mask, axis=1)
-    py = np.sum(pt * np.sin(phi) * mask, axis=1)
-    pz = np.sum(pt * np.sinh(eta) * mask, axis=1)
+    E  = np.sum(pt * np.cosh(eta), axis=1)
+    px = np.sum(pt * np.cos(phi), axis=1)
+    py = np.sum(pt * np.sin(phi), axis=1)
+    pz = np.sum(pt * np.sinh(eta), axis=1)
 
     jet_pt = np.sqrt(px**2 + py**2)
     jet_phi = np.arctan2(py, px)
@@ -204,14 +227,22 @@ def jets_from_constituents(p, mask):
     pabs = np.sqrt(px**2 + py**2 + pz**2)
     jet_eta = 0.5 * np.log((pabs + pz + 1e-12) / (pabs - pz + 1e-12))
 
-    return jet_pt, jet_eta, jet_phi
+    mass = np.sqrt(np.clip(E**2 - px**2 - py**2 - pz**2, 0, None))
 
-pt_true, eta_true, phi_true = jets_from_constituents(all_x, all_mask)
-pt_reco, eta_reco, phi_reco = jets_from_constituents(all_xhat, all_mask)
+    return jet_pt, jet_eta, jet_phi, mass
 
-pt_ratio = pt_reco / (pt_true + 1e-12)
-eta_diff = eta_reco - eta_true
-phi_diff = np.arctan2(np.sin(phi_reco - phi_true), np.cos(phi_reco - phi_true))
+def jet_multiplicity(mask):
+    return mask.sum(axis=1)
+
+pt_true, eta_true, phi_true, mass_true = jets_from_constituents(all_x, all_mask)
+pt_decoded, eta_decoded, phi_decoded, mass_decoded = jets_from_constituents(all_xhat, all_mask)
+mult_true = jet_multiplicity(all_mask)
+mult_decoded = jet_multiplicity((all_xhat[:, :, 0] > 0).astype(np.float32))
+
+pt_ratio = pt_decoded / (pt_true + 1e-12)
+eta_diff = eta_decoded - eta_true
+phi_diff = np.arctan2(np.sin(phi_decoded - phi_true), np.cos(phi_decoded - phi_true))
+mass_ratio = mass_decoded / (mass_true + 1e-12)
 
 ### plot after evaluation
 import matplotlib.pyplot as plt
@@ -297,7 +328,7 @@ plot_constituent_hist(
     bins=np.linspace(0, 500, 50),
     xlabel="Constituent $pT$ [GeV]",
     title="Decoded Constituents: $pT$",
-    filename=f"vae_constituent_pt_z{zdim}.png",
+    filename=f"{model_type}_constituent_pt_z{zdim}.png",
     logy=True,
     ylim=(1, 1e5)
 )
@@ -309,7 +340,7 @@ plot_constituent_hist(
     bins=np.linspace(-5, 5, 60),
     xlabel="Constituent $\\eta$",
     title="Decoded Constituents: $\\eta$",
-    filename=f"vae_constituent_eta_z{zdim}.png"
+    filename=f"{model_type}_constituent_eta_z{zdim}.png"
 )
 
 plot_constituent_hist(
@@ -319,7 +350,73 @@ plot_constituent_hist(
     bins=np.linspace(-1, 7, 64),
     xlabel="Contituent $\\phi$",
     title="Decoded Constituents: $\\phi$",
-    filename=f"vae_constituent_phi_z{zdim}.png"
+    filename=f"{model_type}_constituent_phi_z{zdim}.png"
+)
+
+#### response plots
+def plot_jet_hist(true_vals, decoded_vals, labels, bins, xlabel, title, filename, logy=False):
+    qjet = (labels == 0)
+    gjet = (labels != 0)
+
+    plt.figure()
+    for vals, style, tag in [(true_vals, "solid", "true"), (decoded_vals, "dashed", "decoded")]:
+        plt.hist(vals[qjet], bins=bins, histtype="step", linewidth=1.5,
+                 linestyle=style, label=f"quark {tag}", color="red")
+        plt.hist(vals[gjet], bins=bins, histtype="step", linewidth=1.5,
+                 linestyle=style, label=f"gluon {tag}", color="blue")
+    plt.xlabel(xlabel)
+    plt.ylabel("Counts")
+    plt.title(title)
+    plt.legend(fontsize=8)
+    if logy:
+        plt.yscale("log")
+    plt.tight_layout()
+    plt.savefig(os.path.join(plot_dir, filename), dpi=200)
+    plt.close()
+
+plot_jet_hist(
+    pt_true, pt_decoded, labels,
+    bins=np.linspace(0, max(np.percentile(np.concatenate([pt_true, pt_decoded]), 99.5), 1.0), 60),
+    xlabel="Jet $pT$ [GeV]",
+    title="Jet $pT$: True vs Decoded",
+    filename=f"jet_pt_z{zdim}.png",
+    logy=True
+)
+
+plot_jet_hist(
+    eta_true, eta_decoded, labels,
+    bins=np.linspace(
+        min(np.percentile(np.concatenate([eta_true, eta_decoded]), 0.5), -0.1),
+        max(np.percentile(np.concatenate([eta_true, eta_decoded]), 99.5), 0.1),
+        60,
+    ),
+    xlabel="Jet $\\eta$",
+    title="Jet $\\eta$: True vs Decoded",
+    filename=f"jet_eta_z{zdim}.png"
+)
+
+plot_jet_hist(
+    phi_true, phi_decoded, labels,
+    bins=np.linspace(-np.pi, np.pi, 64),
+    xlabel="Jet $\\phi$",
+    title="Jet $\\phi$: True vs Decoded",
+    filename=f"jet_phi_z{zdim}.png"
+)
+
+plot_jet_hist(
+    mass_true, mass_decoded, labels,
+    bins=np.linspace(0, 500, 60),
+    xlabel="Jet Mass [GeV]",
+    title="Jet Mass: True vs Decoded",
+    filename=f"jet_mass_z{zdim}.png"
+)
+
+plot_jet_hist(
+    mult_true, mult_decoded, labels,
+    bins=np.arange(0, int(mult_true.max()) + 2) - 0.5,
+    xlabel="Jet Multiplicity",
+    title="Jet Multiplicity: True vs Decoded",
+    filename=f"jet_multiplicity_z{zdim}.png"
 )
 
 #### response plots
@@ -357,7 +454,7 @@ plot_response_hist(
     pt_ratio,
     labels,
     bins=np.linspace(0, 2, 60),
-    xlabel="$pT_{reco} / pT_{true}$",
+    xlabel="$pT_{decoded} / pT_{true}$",
     title="Jet Response: $pT$ Ratio",
     filename=f"response_pt_ratio_z{zdim}.png"
 )
@@ -366,7 +463,7 @@ plot_response_hist(
     eta_diff,
     labels,
     bins=np.linspace(-1, 1, 60),
-    xlabel="$\\eta_{reco} - \\eta_{true}$",
+    xlabel="$\\eta_{decoded} - \\eta_{true}$",
     title="Jet Response: $\\eta$ Residual",
     filename=f"response_eta_residual_z{zdim}.png"
 )
@@ -375,9 +472,18 @@ plot_response_hist(
     phi_diff,
     labels,
     bins=np.linspace(-1, 1, 60),
-    xlabel="$\\phi_{reco} - \\phi_{true}$",
+    xlabel="$\\phi_{decoded} - \\phi_{true}$",
     title="Jet Response: $\\phi$ Residual",
     filename=f"response_phi_residual_z{zdim}.png"
+)
+
+plot_response_hist(
+    mass_ratio,
+    labels,
+    bins=np.linspace(0, 2, 60),
+    xlabel="$m_{decoded} / m_{true}$",
+    title="Jet Response: Mass Ratio",
+    filename=f"response_mass_ratio_z{zdim}.png"
 )
 
 run.log({
@@ -387,6 +493,10 @@ run.log({
     "eval/eta_diff_std": float(np.std(eta_diff)),
     "eval/phi_diff_mean": float(np.mean(phi_diff)),
     "eval/phi_diff_std": float(np.std(phi_diff)),
+    "eval/mass_ratio_mean": float(np.mean(mass_ratio)),
+    "eval/mass_ratio_std": float(np.std(mass_ratio)),
+    "eval/mult_true_mean": float(np.mean(mult_true)),
+    "eval/mult_decoded_mean": float(np.mean(mult_decoded)),
 })
 
 for plot_name in sorted(os.listdir(plot_dir)):
