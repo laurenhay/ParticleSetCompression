@@ -1,13 +1,13 @@
 #!/bin/bash
-#SBATCH -J trainVAE_%a           # Job name
+#SBATCH -J trainAE_%a           # Job name
 #SBATCH --array=0-3
 #SBATCH -p gpu
 #SBATCH -n 4 # Number of cpu cores
 #SBATCH --gres=gpu:2
 #SBATCH --mem=64G                    # Memory per node
 #SBATCH -t 36:00:00                 # Time limit (hh:mm:ss)
-#SBATCH -o /users/lhay/scratch/trainVAE_%A_%a.out         # Standard output log
-#SBATCH -e /users/lhay/scratch/trainVAE_%A_%a.err         # Standard error log
+#SBATCH -o /users/lhay/scratch/trainAE_%A_%a.out         # Standard output log
+#SBATCH -e /users/lhay/scratch/trainAE_%A_%a.err         # Standard error log
 
 echo "Starting job ${SLURM_ARRAY_TASK_ID:-single} on $HOSTNAME"
 
@@ -15,8 +15,8 @@ echo "Starting job ${SLURM_ARRAY_TASK_ID:-single} on $HOSTNAME"
 source torch_env/bin/activate
 
 # Optional CLI override for single-run submissions:
-#   sbatch trainVAE.sh pythia VAE
-#   sbatch trainVAE.sh herwig PSAE
+#   sbatch trainAE.sh pythia VAE
+#   sbatch trainAE.sh herwig PSAE
 # If no args are provided, array task IDs map to:
 #   0 -> pythia VAE
 #   1 -> pythia PSAE
@@ -44,4 +44,4 @@ echo "Generator: ${GENERATOR}"
 echo "Model: ${MODEL}"
 
 # Run the training script
-python3 -u trainVAE.py --generator "$GENERATOR" --model "$MODEL"
+python3 -u trainAE.py --generator "$GENERATOR" --model "$MODEL"

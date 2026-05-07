@@ -1,8 +1,8 @@
 A particle-level autoencoder for compressing jet constituent data.
 
-## Training with trainVAE.py
+## Training with trainAE.py
 
-Main training entry point: [trainVAE.py](trainVAE.py)
+Main training entry point: [trainAE.py](trainAE.py)
 
 Supported CLI options:
 - --generator / -g: pythia (default) or herwig
@@ -14,13 +14,13 @@ Examples:
 source torch_env/bin/activate
 
 # Default run (pythia + VAE)
-python trainVAE.py
+python trainAE.py
 
 # Herwig with VAE
-python trainVAE.py --generator herwig --model VAE
+python trainAE.py --generator herwig --model VAE
 
 # Pythia with PSAE
-python trainVAE.py --generator pythia --model PSAE
+python trainAE.py --generator pythia --model PSAE
 ```
 
 Outputs:
@@ -31,7 +31,7 @@ Outputs:
 
 Current SLURM script in this repo: [trainAE.sh](trainAE.sh)
 
-Note: this script launches [trainVAE.py](trainVAE.py). The script name is trainAE.sh, even though the comments and job names refer to VAE.
+Note: this script launches [trainAE.py](trainAE.py). The script name is trainAE.sh, even though the comments and job names refer to VAE.
 
 ### Submit all 4 generator/model combinations
 
@@ -55,5 +55,5 @@ sbatch trainAE.sh pythia VAE
 ```
 
 SLURM logs are written to:
-- /users/lhay/scratch/trainVAE_<array_job_id>_<task_id>.out
-- /users/lhay/scratch/trainVAE_<array_job_id>_<task_id>.err
+- /users/lhay/scratch/trainAE_<array_job_id>_<task_id>.out
+- /users/lhay/scratch/trainAE_<array_job_id>_<task_id>.err
