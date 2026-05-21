@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH -J trainAE_%a           # Job name
-#SBATCH --array=0-3
+#SBATCH --array=0-5
 #SBATCH -p gpu
 #SBATCH -n 4 # Number of cpu cores
 #SBATCH --gres=gpu:2
@@ -15,33 +15,39 @@ echo "Starting job ${SLURM_ARRAY_TASK_ID:-single} on $HOSTNAME"
 source torch_env/bin/activate
 
 # Optional CLI override for single-run submissions:
-#   sbatch trainAE.sh pythia VAE
-#   sbatch trainAE.sh herwig PSAE
+#   sbatch trainAE.sh pythia VAE MSE
+#   sbatch trainAE.sh herwig PSAE SWD
 # If no args are provided, array task IDs map to:
-#   0 -> pythia VAE
-#   1 -> pythia PSAE
-#   2 -> herwig VAE
-#   3 -> herwig PSAE
+#   0 -> pythia VAE  MSE
+#   1 -> pythia PSAE MSE
+#   2 -> pythia PSAE SWD
+#   3 -> herwig VAE  MSE
+#   4 -> herwig PSAE MSE
+#   5 -> herwig PSAE SWD
 
-if [[ -n "$1" && -n "$2" ]]; then
+if [[ -n "$1" && -n "$2" && -n "$3" ]]; then
 	GENERATOR="$1"
 	MODEL="$2"
+	LOSS="$3"
 else
-	GENERATORS=(pythia pythia herwig herwig)
-	MODELS=(VAE PSAE VAE PSAE)
+	GENERATORS=(pythia pythia pythia herwig herwig herwig)
+	MODELS=(VAE    PSAE   PSAE   VAE    PSAE   PSAE  )
+	LOSSES=(MSE    MSE    SWD    MSE    MSE    SWD   )
 	TASK_ID="${SLURM_ARRAY_TASK_ID:-0}"
 
 	if [[ "$TASK_ID" -lt 0 || "$TASK_ID" -ge "${#GENERATORS[@]}" ]]; then
-		echo "Invalid SLURM_ARRAY_TASK_ID=$TASK_ID. Expected 0-3."
+		echo "Invalid SLURM_ARRAY_TASK_ID=$TASK_ID. Expected 0-5."
 		exit 1
 	fi
 
 	GENERATOR="${GENERATORS[$TASK_ID]}"
 	MODEL="${MODELS[$TASK_ID]}"
+	LOSS="${LOSSES[$TASK_ID]}"
 fi
 
 echo "Generator: ${GENERATOR}"
 echo "Model: ${MODEL}"
+echo "Loss: ${LOSS}"
 
 # Run the training script
-python3 -u trainAE.py --generator "$GENERATOR" --model "$MODEL"
+python3 -u trainAE.py --generator "$GENERATOR" --model "$MODEL" --loss "$LOSS"

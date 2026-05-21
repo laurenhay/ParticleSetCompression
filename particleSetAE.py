@@ -1,20 +1,7 @@
 import torch
 from torch import nn
-import torch.nn.functional as F
-
 
 class ParticleSetAE(nn.Module):
-    """
-    Variable-length particle-list autoencoder.
-
-    Input:
-        x:    (batch, max_particles, particle_features)
-        mask: (batch, max_particles), True for real particles, False for padding
-
-    Example particle_features:
-        [pt, eta, phi, mass] or [z, y, phi, pid, charge, ...]
-    """
-
     def __init__(
         self,
         particle_dim=4,
@@ -24,12 +11,10 @@ class ParticleSetAE(nn.Module):
         hidden=200,
     ):
         super().__init__()
-
         self.max_particles = max_particles
         self.particle_dim = particle_dim
         self.z_dim = z_dim
 
-        # Per-particle map Phi
         self.phi = nn.Sequential(
             nn.Linear(particle_dim, hidden),
             nn.LeakyReLU(),
@@ -39,7 +24,6 @@ class ParticleSetAE(nn.Module):
             nn.LeakyReLU(),
         )
 
-        # Event-level map to latent bottleneck
         self.encoder_head = nn.Sequential(
             nn.Linear(phi_dim, 100),
             nn.LeakyReLU(),
@@ -48,37 +32,42 @@ class ParticleSetAE(nn.Module):
             nn.Linear(50, z_dim),
         )
 
-        # Simple fixed-size decoder: reconstruct padded particle tensor
-        self.decoder = nn.Sequential(
-            nn.Linear(z_dim, 50),
+        # z_dim + 1 for the appended n_real fraction
+        self.decoder_shared = nn.Sequential(
+            nn.Linear(z_dim + 1, 50),
             nn.LeakyReLU(),
             nn.Linear(50, 100),
             nn.LeakyReLU(),
             nn.Linear(100, hidden),
             nn.LeakyReLU(),
-            nn.Linear(hidden, max_particles * particle_dim),
         )
 
+        # head 1: particle features
+        self.decoder_features = nn.Linear(hidden, max_particles * particle_dim)
+
+        # head 2: per-slot occupancy logit (is this slot a real particle?)
+        self.decoder_mask = nn.Linear(hidden, max_particles)
+
     def encode(self, x, mask):
-        # x: (B, N, D), mask: (B, N)
-
-        h = self.phi(x)  # (B, N, phi_dim)
-
-        # zero out padded particles before pooling
+        h = self.phi(x)
         h = h * mask.unsqueeze(-1)
-
-        # permutation-invariant pooling
-        pooled = h.sum(dim=1)  # (B, phi_dim)
-
+        pooled = h.sum(dim=1)
         z = self.encoder_head(pooled)
-        return z
 
-    def decode(self, z):
-        out = self.decoder(z)
-        out = out.view(-1, self.max_particles, self.particle_dim)
-        return out
+        n_real = mask.sum(dim=1, keepdim=True) / self.max_particles  # (B, 1)
+        z_aug = torch.cat([z, n_real], dim=-1)
+        return z_aug
+
+    def decode(self, z_aug):
+        h = self.decoder_shared(z_aug)
+
+        features = self.decoder_features(h)
+        features = features.view(-1, self.max_particles, self.particle_dim)
+
+        mask_logits = self.decoder_mask(h)   # (B, max_particles), raw logits
+        return features, mask_logits
 
     def forward(self, x, mask):
-        z = self.encode(x, mask)
-        xhat = self.decode(z)
-        return xhat, z
+        z_aug = self.encode(x, mask)
+        xhat, mask_logits = self.decode(z_aug)
+        return xhat, mask_logits, z_aug
