@@ -65,6 +65,18 @@ class ParticleSetAE(nn.Module):
         features = features.view(-1, self.max_particles, self.particle_dim)
 
         mask_logits = self.decoder_mask(h)   # (B, max_particles), raw logits
+
+        # Gate features by predicted occupancy so empty slots stay near zero.
+        # Soft sigmoid during training keeps gradients flowing; at eval time the
+        # predicted hard mask already zeroes them out in jets_from_constituents.
+        soft_mask = torch.sigmoid(mask_logits).unsqueeze(-1)  # (B, N, 1)
+
+        # Gate eta and phi toward zero for empty slots, but leave pt ungated
+        # so the jet pt loss has a clean gradient path
+        gate = torch.ones_like(features)
+        gate[:, :, 1:] = soft_mask  # apply to eta, phi only (indices 1, 2)
+        features = features * gate
+
         return features, mask_logits
 
     def forward(self, x, mask):

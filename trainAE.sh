@@ -30,9 +30,9 @@ if [[ -n "$1" && -n "$2" && -n "$3" ]]; then
 	MODEL="$2"
 	LOSS="$3"
 else
-	GENERATORS=(pythia pythia pythia herwig herwig herwig)
-	MODELS=(VAE    PSAE   PSAE   VAE    PSAE   PSAE  )
-	LOSSES=(MSE    MSE    SWD    MSE    MSE    SWD   )
+	GENERATORS=(pythia pythia herwig herwig)
+	MODELS=(    PSAE   PSAE   PSAE   PSAE  )
+	LOSSES=(    MSE    SWD    MSE    SWD   )
 	TASK_ID="${SLURM_ARRAY_TASK_ID:-0}"
 
 	if [[ "$TASK_ID" -lt 0 || "$TASK_ID" -ge "${#GENERATORS[@]}" ]]; then

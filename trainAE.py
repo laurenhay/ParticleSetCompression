@@ -23,6 +23,10 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--generator", "-g", type = str, default = "pythia", required = False, help = "Which generator to use: options are herwig and pythia")
 parser.add_argument("--model", "-m", type = str, default = "VAE", choices = ["VAE", "PSAE"], help = "Which model to use: VAE or Particle Set AE")
 parser.add_argument("--loss", "-l", type = str, default = "MSE", choices = ["MSE", "SWD"], help = "Which loss function to use for PSAE -- mean square error or sliced wasserstein")
+parser.add_argument("--N", "-n", type = int, default = 100000, help = "Number of jets to train w/")
+parser.add_argument("--output-path", "-o", type = str,
+    default = "/oscar/data/mleblan6/lhay/autoencoder/output/QG_jets_{generator}_{model_type}_{loss_label}_N{N}_noSoftmaskOnPT.npz",
+    help = "Template path for the compressed output .npz file. May use {generator}, {model_type}, {loss_label}, and {N} placeholders, which are filled in based on the run's settings.")
 args = parser.parse_args()
 
 generator = args.generator
@@ -37,13 +41,13 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("Using device:", device)
 
 ##### check whether pythia dataset exists
-N = 1000
+
 if generator == "pythia":
-    input_path = "work/qg_jets/generator:pythia/with_bc:False/QG_jets.npz"
+    input_path = "/oscar/data/mleblan6/energyflow/datasets/QG_jets.npz"
 else:
     generator = "herwig"
-    input_path = "work/qg_jets/generator:herwig/with_bc:False/QG_jets_herwig_0.npz"
-
+    input_path = "/oscar/data/mleblan6/energyflow/datasets/QG_jets_herwig_0.npz"
+N = args.N
 if not os.path.exists(input_path):
     dir = "work"
     jets, labels = load("qg_jets", N, cache_dir=dir, generator = generator)
@@ -68,14 +72,18 @@ class JetDataset(Dataset):
 
     def __getitem__(self, idx):
         return self.jets[idx], self.mask[idx]
-    
-dataset = JetDataset(jets[:, :, :3], mask)
+
+jets_input = jets[:, :, :3].copy()
+jets_input[:, :, 0] = np.log1p(jets_input[:, :, 0])  # log(1+pt) to equalize scale with eta/phi
+dataset = JetDataset(jets_input, mask)
 feature_dim = dataset.jets.shape[-1]
+
+batch_size = 512
 
 ### use torch loading
 loader = DataLoader(
     dataset,
-    batch_size=64,
+    batch_size=batch_size,
     shuffle=True,
     drop_last=False,
     num_workers=4
@@ -84,6 +92,7 @@ print("Feature dim (should be 3) ", feature_dim)
 print("Nparticles ", len(mask[0]))
 
 nconst = len(mask[0])
+
 zdim = nconst*feature_dim
 if model_type == "VAE":
     model = JetDeepSetVAE(
@@ -100,9 +109,12 @@ else:
 
 learning_rate = 1e-3
 beta = 1e-3
-batch_size = 64
-epochs = 20
+epochs = 1000
+early_stop_patience = 100
 optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+    optimizer, patience=50, factor=0.5, min_lr=1e-6
+)
 # Start a new wandb run to track this script.
 run = wandb.init(
     name = f"{generator}_{model_type}_{loss_label}_{timestamp}",
@@ -125,6 +137,9 @@ run = wandb.init(
 
 
 wandb.watch(model, log="all", log_freq=100)
+
+best_loss = float("inf")
+no_improve_count = 0
 
 for epoch in range(epochs):
     model.train()
@@ -175,21 +190,37 @@ for epoch in range(epochs):
     else:
         epoch_bce   = running_bce   / len(loader)
         if loss_type=="MSE":
-            print(f"epoch {epoch:02d}  loss={epoch_loss:.6f}")
+            epoch_recon = running_recon / len(loader)
+            print(f"epoch {epoch:02d}  loss={epoch_loss:.6f}  recon={epoch_recon:.6f}  bce={epoch_bce:.6f}")
             run.log({
                 "epoch": epoch,
                 "train/loss": epoch_loss,
-                "train/bce": epoch_bce
+                "train/recon": epoch_recon,
+                "train/bce": epoch_bce,
             })
         elif loss_type=="SWD":
             epoch_recon = running_recon / len(loader)
             epoch_swd = running_swd / len(loader)
-            print(f"epoch {epoch:02d}  loss={epoch_loss:.6f} recon={epoch_recon:.6f}  kl={epoch_swd:.6f}")
-            run.log({"train/loss": epoch_loss, 
-                    "train/recon": epoch_recon, 
-                    "train/swd": epoch_swd,
-                    "train/bce": epoch_bce
-                    })
+            print(f"epoch {epoch:02d}  loss={epoch_loss:.6f}  recon={epoch_recon:.6f}  swd={epoch_swd:.6f}  bce={epoch_bce:.6f}")
+            run.log({
+                "epoch": epoch,
+                "train/loss": epoch_loss,
+                "train/recon": epoch_recon,
+                "train/swd": epoch_swd,
+                "train/bce": epoch_bce,
+            })
+
+    scheduler.step(epoch_loss)
+    run.log({"train/lr": optimizer.param_groups[0]["lr"]})
+
+    if epoch_loss < best_loss:
+        best_loss = epoch_loss
+        no_improve_count = 0
+    else:
+        no_improve_count += 1
+        if no_improve_count >= early_stop_patience:
+            print(f"Early stopping at epoch {epoch} (no improvement for {early_stop_patience} epochs)")
+            break
 
 eval_loader = DataLoader(
     dataset,
@@ -232,25 +263,36 @@ all_mask_pred = torch.cat(all_mask_pred, dim=0).numpy()
 if model_type == "VAE":
     all_mu = torch.cat(all_mu, dim=0).numpy()
 
+compressed_output_path = args.output_path.format(generator=generator, model_type=model_type, loss_label=loss_label, N=N)
+np.savez_compressed(
+    compressed_output_path,
+    X=all_xhat,
+    y=np.asarray(labels),
+)
+print(f"Saved compressed particles to {compressed_output_path}")
+
 def jets_from_constituents(p, mask):
-    pt  = p[:, :, 0] * mask
-    eta = p[:, :, 1] * mask
-    phi = p[:, :, 2] * mask
+    pt  = np.where(mask > 0, np.expm1(p[:, :, 0]), 0.0)  # invert log1p
+    eta = np.where(mask > 0, p[:, :, 1], 0.0)
+    phi = np.where(mask > 0, p[:, :, 2], 0.0)
 
-    E  = np.sum(pt * np.cosh(eta), axis=1)
-    px = np.sum(pt * np.cos(phi), axis=1)
-    py = np.sum(pt * np.sin(phi), axis=1)
-    pz = np.sum(pt * np.sinh(eta), axis=1)
+    constituents = ak.zip(
+        {
+            "pt":   ak.Array(pt),
+            "eta":  ak.Array(eta),
+            "phi":  ak.Array(phi),
+            "mass": ak.Array(np.zeros_like(pt)),  # massless assumption
+        },
+        with_name="Momentum4D",
+    )
+    jets = ak.sum(constituents, axis=1)
 
-    jet_pt = np.sqrt(px**2 + py**2)
-    jet_phi = np.arctan2(py, px)
-
-    pabs = np.sqrt(px**2 + py**2 + pz**2)
-    jet_eta = 0.5 * np.log((pabs + pz + 1e-12) / (pabs - pz + 1e-12))
-
-    mass = np.sqrt(np.clip(E**2 - px**2 - py**2 - pz**2, 0, None))
-
-    return jet_pt, jet_eta, jet_phi, mass
+    return (
+        ak.to_numpy(jets.pt),
+        ak.to_numpy(jets.eta),
+        ak.to_numpy(jets.phi),
+        ak.to_numpy(jets.mass),   # non-zero from 4-vector sum even with massless inputs
+    )
 
 def jet_multiplicity(mask):
     return mask.sum(axis=1)
@@ -269,218 +311,178 @@ mass_ratio = mass_decoded / (mass_true + 1e-12)
 ### plot after evaluation
 import matplotlib.pyplot as plt
 labels = np.array(labels).astype(int)
-plot_dir = "plots"
+plot_dir = f"plots/{model_type}"
 os.makedirs(plot_dir, exist_ok=True)
 
-def plot_constituent_hist(true_values, decoded_values, true_mask, decoded_mask, labels, bins, xlabel, title, filename, logy=False, ylim=None, config_label=None):
+# constituent pt is stored in log1p space; invert for display in GeV
+const_pt_true    = np.expm1(all_x[..., 0])
+const_pt_decoded = np.expm1(all_xhat[..., 0])
+
+def plot_constituent_hist(true_values, decoded_values, true_mask, decoded_mask, labels, bins, xlabel, title, filename, logy=False, ylim=None):
     qjet = (labels == 0)
     gjet = (labels != 0)
 
-    plt.figure()
-    for vals, style, tag, cmask in [(true_values,    "solid",  "true",    true_mask), (decoded_values, "dashed", "decoded", decoded_mask),]:
+    fig, ax = plt.subplots()
+    for vals, style, tag, cmask in [
+        (true_values,    "solid",  "true",    true_mask),
+        (decoded_values, "dashed", "decoded", decoded_mask),
+    ]:
         qvals = vals[qjet][cmask[qjet].astype(bool)].reshape(-1)
         gvals = vals[gjet][cmask[gjet].astype(bool)].reshape(-1)
-        plt.hist(qvals, bins=bins, histtype="step", linewidth=1.5,
-                 linestyle=style, label=f"quark {tag}", color="red")
-        plt.hist(gvals, bins=bins, histtype="step", linewidth=1.5,
-                 linestyle=style, label=f"gluon {tag}", color="blue")
+        ax.hist(qvals, bins=bins, histtype="step", linewidth=1.5, linestyle=style, label=f"quark {tag}", color="red")
+        ax.hist(gvals, bins=bins, histtype="step", linewidth=1.5, linestyle=style, label=f"gluon {tag}", color="blue")
 
-    plt.xlabel(xlabel)
-    plt.ylabel("Counts")
-    full_title = f"{title}\n{config_label}" if config_label else title
-    plt.title(full_title, fontsize=10)
-    plt.legend(fontsize=8)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel("Counts")
+    ax.set_title(f"{title}\n{config_label}", fontsize=10)
+    ax.legend(fontsize=8)
     if logy:
-        plt.yscale("log")
+        ax.set_yscale("log")
     if ylim is not None:
-        plt.ylim(*ylim)
-    plt.tight_layout()
-    plt.savefig(os.path.join(plot_dir, filename), dpi=200)
-    plt.close()
-    
-####plot constituent distributions: true vs decoded
-plot_constituent_hist(
-    all_x[..., 0],
-    all_xhat[..., 0],
+        ax.set_ylim(*ylim)
+    fig.tight_layout()
+    fig.savefig(os.path.join(plot_dir, filename), dpi=200)
+    return fig
+
+
+def plot_jet_panel(true_vals, decoded_vals, response_vals, labels,
+                   dist_bins, resp_bins, dist_xlabel, resp_xlabel, title, filename,
+                   logy_dist=False):
+    """Two-panel figure: true vs decoded distribution (top) + response/residual (bottom)."""
+    qjet = (labels == 0)
+    gjet = (labels != 0)
+
+    fig, (ax_top, ax_bot) = plt.subplots(2, 1, figsize=(6, 7),
+                                          gridspec_kw={"height_ratios": [2, 1]})
+    ax_top.set_title(f"{title}\n{config_label}", fontsize=10)
+
+    for vals, style, tag in [(true_vals, "solid", "true"), (decoded_vals, "dashed", "decoded")]:
+        ax_top.hist(vals[qjet], bins=dist_bins, histtype="step", linewidth=1.5,
+                    linestyle=style, label=f"quark {tag}", color="red")
+        ax_top.hist(vals[gjet], bins=dist_bins, histtype="step", linewidth=1.5,
+                    linestyle=style, label=f"gluon {tag}", color="blue")
+    ax_top.set_xlabel(dist_xlabel)
+    ax_top.set_ylabel("Counts")
+    ax_top.legend(fontsize=8)
+    if logy_dist:
+        ax_top.set_yscale("log")
+
+    ax_bot.hist(response_vals[qjet], bins=resp_bins, histtype="step", linewidth=1.5, label="quark", color="red")
+    ax_bot.hist(response_vals[gjet], bins=resp_bins, histtype="step", linewidth=1.5, label="gluon", color="blue")
+    ax_bot.set_xlabel(resp_xlabel)
+    ax_bot.set_ylabel("Counts")
+    ax_bot.legend(fontsize=8)
+
+    fig.tight_layout()
+    fig.savefig(os.path.join(plot_dir, filename), dpi=200)
+    return fig
+
+
+# ---- constituent distributions (true vs decoded) ----
+const_pt_hist = plot_constituent_hist(
+    const_pt_true, const_pt_decoded,
     all_mask, all_mask_pred,
     labels,
     bins=np.linspace(0, 500, 50),
-    xlabel="Constituent $pT$ [GeV]",
-    title="Constituents: $pT$ True vs Decoded",
-    filename=f"Constituent_pt_z{zdim}.png",
+    xlabel="Constituent $p_T$ [GeV]",
+    title="Constituents: $p_T$ True vs Decoded",
+    filename=f"constituent_pt_z{zdim}_{generator}_{loss_label}.png",
     logy=True,
-    ylim=(1, 1e5),
-    config_label=config_label
 )
 
-plot_constituent_hist(
-    all_x[..., 1],
-    all_xhat[..., 1],
+const_eta_hist = plot_constituent_hist(
+    all_x[..., 1], all_xhat[..., 1],
     all_mask, all_mask_pred,
     labels,
     bins=np.linspace(-5, 5, 60),
     xlabel="Constituent $\\eta$",
     title="Constituents: $\\eta$ True vs Decoded",
-    filename=f"Constituent_eta_z{zdim}.png",
-    config_label=config_label
+    filename=f"constituent_eta_z{zdim}_{generator}_{loss_label}.png",
 )
 
-plot_constituent_hist(
-    all_x[..., 2],
-    all_xhat[..., 2],
+const_phi_hist = plot_constituent_hist(
+    all_x[..., 2], all_xhat[..., 2],
     all_mask, all_mask_pred,
     labels,
-    bins=np.linspace(-1, 7, 64),
+    bins=np.linspace(-0.5, 7, 64),
     xlabel="Constituent $\\phi$",
     title="Constituents: $\\phi$ True vs Decoded",
-    filename=f"Constituent_phi_z{zdim}.png",
-    config_label=config_label
+    filename=f"constituent_phi_z{zdim}_{generator}_{loss_label}.png",
 )
 
-#### response plots
-def plot_jet_hist(true_vals, decoded_vals, labels, bins, xlabel, title, filename, logy=False, config_label=None):
-    qjet = (labels == 0)
-    gjet = (labels != 0)
 
-    plt.figure()
-    for vals, style, tag in [(true_vals, "solid", "true"), (decoded_vals, "dashed", "decoded")]:
-        plt.hist(vals[qjet], bins=bins, histtype="step", linewidth=1.5,
-                 linestyle=style, label=f"quark {tag}", color="red")
-        plt.hist(vals[gjet], bins=bins, histtype="step", linewidth=1.5,
-                 linestyle=style, label=f"gluon {tag}", color="blue")
-    plt.xlabel(xlabel)
-    plt.ylabel("Counts")
-    full_title = f"{title}\n{config_label}" if config_label else title
-    plt.title(full_title, fontsize=10)
-    plt.legend(fontsize=8)
-    if logy:
-        plt.yscale("log")
-    plt.tight_layout()
-    plt.savefig(os.path.join(plot_dir, filename), dpi=200)
-    plt.close()
-
-plot_jet_hist(
-    pt_true, pt_decoded, labels,
-    bins=np.linspace(0, max(np.percentile(np.concatenate([pt_true, pt_decoded]), 99.5), 1.0), 60),
-    xlabel="Jet $pT$ [GeV]",
-    title="Jet $pT$: True vs Decoded",
-    filename=f"jet_pt_z{zdim}.png",
-    logy=True,
-    config_label=config_label
+jet_pt_hist = plot_jet_panel(
+    pt_true, pt_decoded, pt_ratio, labels,
+    dist_bins=np.linspace(0, max(np.percentile(np.concatenate([pt_true, pt_decoded]), 99.5), 1.0), 60),
+    resp_bins=np.linspace(0, 2, 60),
+    dist_xlabel="Jet $p_T$ [GeV]",
+    resp_xlabel="$p_T^{\\mathrm{dec}} / p_T^{\\mathrm{true}}$",
+    title="Jet $p_T$: True vs Decoded",
+    filename=f"jet_pt_z{zdim}_{generator}_{loss_label}.png",
+    logy_dist=True,
 )
 
-plot_jet_hist(
-    eta_true, eta_decoded, labels,
-    bins=np.linspace(
+jet_eta_hist = plot_jet_panel(
+    eta_true, eta_decoded, eta_diff, labels,
+    dist_bins=np.linspace(
         min(np.percentile(np.concatenate([eta_true, eta_decoded]), 0.5), -0.1),
         max(np.percentile(np.concatenate([eta_true, eta_decoded]), 99.5), 0.1),
         60,
     ),
-    xlabel="Jet $\\eta$",
+    resp_bins=np.linspace(-1, 1, 60),
+    dist_xlabel="Jet $\\eta$",
+    resp_xlabel="$\\eta^{\\mathrm{dec}} - \\eta^{\\mathrm{true}}$",
     title="Jet $\\eta$: True vs Decoded",
-    filename=f"jet_eta_z{zdim}.png",
-    config_label=config_label
+    filename=f"jet_eta_z{zdim}_{generator}_{loss_label}.png",
 )
 
-plot_jet_hist(
-    phi_true, phi_decoded, labels,
-    bins=np.linspace(-np.pi, np.pi, 64),
-    xlabel="Jet $\\phi$",
+jet_phi_hist = plot_jet_panel(
+    phi_true, phi_decoded, phi_diff, labels,
+    dist_bins=np.linspace(-np.pi, np.pi, 64),
+    resp_bins=np.linspace(-1, 1, 60),
+    dist_xlabel="Jet $\\phi$",
+    resp_xlabel="$\\phi^{\\mathrm{dec}} - \\phi^{\\mathrm{true}}$",
     title="Jet $\\phi$: True vs Decoded",
-    filename=f"jet_phi_z{zdim}.png",
-    config_label=config_label
+    filename=f"jet_phi_z{zdim}_{generator}_{loss_label}.png",
 )
 
-plot_jet_hist(
-    mass_true, mass_decoded, labels,
-    bins=np.linspace(0, 500, 60),
-    xlabel="Jet Mass [GeV]",
+jet_mass_hist = plot_jet_panel(
+    mass_true, mass_decoded, mass_ratio, labels,
+    dist_bins=np.linspace(0, max(np.percentile(np.concatenate([mass_true, mass_decoded]), 99.5), 1.0), 60),
+    resp_bins=np.linspace(0, 2, 60),
+    dist_xlabel="Jet Mass [GeV]",
+    resp_xlabel="$m^{\\mathrm{dec}} / m^{\\mathrm{true}}$",
     title="Jet Mass: True vs Decoded",
-    filename=f"jet_mass_z{zdim}.png",
-    config_label=config_label
+    filename=f"jet_mass_z{zdim}_{generator}_{loss_label}.png",
 )
 
-plot_jet_hist(
-    mult_true, mult_decoded, labels,
-    bins=np.arange(0, int(mult_true.max()) + 2) - 0.5,
-    xlabel="Jet Multiplicity",
+mult_diff = mult_decoded - mult_true
+jet_mult_hist = plot_jet_panel(
+    mult_true, mult_decoded, mult_diff, labels,
+    dist_bins=np.arange(0, int(max(mult_true.max(), mult_decoded.max())) + 2) - 0.5,
+    resp_bins=np.arange(int(mult_diff.min()) - 1, int(mult_diff.max()) + 2) - 0.5,
+    dist_xlabel="Jet Multiplicity",
+    resp_xlabel="Multiplicity$^{\\mathrm{dec}}$ $-$ Multiplicity$^{\\mathrm{true}}$",
     title="Jet Multiplicity: True vs Decoded",
-    filename=f"jet_multiplicity_z{zdim}.png",
-    config_label=config_label
+    filename=f"jet_multiplicity_z{zdim}_{generator}_{loss_label}.png",
 )
 
-#### response plots
-def plot_response_hist(values, labels, bins, xlabel, title, filename, config_label=None):
-    qjet = (labels == 0)
-    gjet = (labels != 0)
-
-    plt.figure()
-    plt.hist(
-        values[qjet].reshape(-1),
-        bins=bins,
-        histtype="step",
-        linewidth=1.5,
-        label="quark jets",
-        color="red"
-    )
-    plt.hist(
-        values[gjet].reshape(-1),
-        bins=bins,
-        histtype="step",
-        linewidth=1.5,
-        label="gluon jets",
-        color="blue"
-    )
-
-    plt.xlabel(xlabel)
-    plt.ylabel("Counts")
-    full_title = f"{title}\n{config_label}" if config_label else title
-    plt.title(full_title, fontsize=10)
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(os.path.join(plot_dir, filename), dpi=200)
-    plt.close()
-
-plot_response_hist(
-    pt_ratio,
-    labels,
-    bins=np.linspace(0, 2, 60),
-    xlabel="$pT_{decoded} / pT_{true}$",
-    title="Jet Response: $pT$ Ratio",
-    filename=f"response_pt_ratio_z{zdim}.png",
-    config_label=config_label
-)
-
-plot_response_hist(
-    eta_diff,
-    labels,
-    bins=np.linspace(-1, 1, 60),
-    xlabel="$\\eta_{decoded} - \\eta_{true}$",
-    title="Jet Response: $\\eta$ Residual",
-    filename=f"response_eta_residual_z{zdim}.png",
-    config_label=config_label
-)
-
-plot_response_hist(
-    phi_diff,
-    labels,
-    bins=np.linspace(-1, 1, 60),
-    xlabel="$\\phi_{decoded} - \\phi_{true}$",
-    title="Jet Response: $\\phi$ Residual",
-    filename=f"response_phi_residual_z{zdim}.png",
-    config_label=config_label
-)
-
-plot_response_hist(
-    mass_ratio,
-    labels,
-    bins=np.linspace(0, 2, 60),
-    xlabel="$m_{decoded} / m_{true}$",
-    title="Jet Response: Mass Ratio",
-    filename=f"response_mass_ratio_z{zdim}.png",
-    config_label=config_label
-)
-
+# Build stable image keys from figures created in this run only.
+_run_figs = [
+    (f"constituent_pt_z{zdim}_{generator}_{loss_label}.png",          const_pt_hist),
+    (f"constituent_eta_z{zdim}_{generator}_{loss_label}.png",         const_eta_hist),
+    (f"constituent_phi_z{zdim}_{generator}_{loss_label}.png",         const_phi_hist),
+    (f"jet_pt_z{zdim}_{generator}_{loss_label}.png",                  jet_pt_hist),
+    (f"jet_eta_z{zdim}_{generator}_{loss_label}.png",                 jet_eta_hist),
+    (f"jet_phi_z{zdim}_{generator}_{loss_label}.png",                 jet_phi_hist),
+    (f"jet_mass_z{zdim}_{generator}_{loss_label}.png",                jet_mass_hist),
+    (f"jet_multiplicity_z{zdim}_{generator}_{loss_label}.png",        jet_mult_hist),
+]
+plot_images = {
+    f"plots/{name.replace(f'_z{zdim}_{generator}_{loss_label}', '')}": wandb.Image(fig)
+    for name, fig in _run_figs
+}
+print(plot_images)
 run.log({
     "eval/pt_ratio_mean": float(np.mean(pt_ratio)),
     "eval/pt_ratio_std": float(np.std(pt_ratio)),
@@ -492,12 +494,8 @@ run.log({
     "eval/mass_ratio_std": float(np.std(mass_ratio)),
     "eval/mult_true_mean": float(np.mean(mult_true)),
     "eval/mult_decoded_mean": float(np.mean(mult_decoded)),
+    **plot_images,
 })
-
-for plot_name in sorted(os.listdir(plot_dir)):
-    plot_path = os.path.join(plot_dir, plot_name)
-    if os.path.isfile(plot_path):
-        run.log({plot_name: wandb.Image(plot_path)})
 
 run.finish()
 
